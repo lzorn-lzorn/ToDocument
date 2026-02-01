@@ -1,5 +1,4 @@
 local A = {}
--- @!all 不会导出
 -- @brief 这是一个示例函数      (brief)
 -- @param x number 第一个参数  (Parameter: name, type_name, description)
 -- @param y number 第二个参数  (Parameter: name, type_name, description)

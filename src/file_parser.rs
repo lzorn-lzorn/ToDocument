@@ -119,30 +119,6 @@ impl LuaFileParser {
         line.trim_start().starts_with(Self::ANNOTATION)
     }
 
-    /// 捕获 API 声明：返回 Some((prefix, name))
-    /// prefix = "function" 或 "local function"
-    /// name = 函数名，如 "add" 或 "A:add" 或 "A.add"
-    pub fn capture_api_declaration(line: &str) -> Option<(String, String)> {
-        static API_DECL_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"^\s*(?P<prefix>local\s+function|function)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
-                .unwrap()
-        });
-
-        if let Some(caps) = API_DECL_RE.captures(line) {
-            let prefix = caps
-                .name("prefix")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let name = caps
-                .name("name")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            Some((prefix, name))
-        } else {
-            None
-        }
-    }
-
     pub fn is_api_tail(line: &str) -> bool {
         return line.ends_with(")") || line.trim_end().ends_with("end");
     }
@@ -286,21 +262,30 @@ impl LuaFileParser {
 
         out.trim_start().trim_end().to_string()
     }
+
+    pub fn create_docblock(buf: Vec<String>) -> DocBlock {
+        return DocBlock {
+            signature: String::new(),
+            brief: String::new(),
+            note: String::new(),
+            includes: vec![],
+            parameters: vec![],
+            descriptions: vec![],
+            ret_value: None,
+            owner_object: String::new(),
+            is_local: false,
+        };
+    }
 }
 impl FileParser for LuaFileParser {
     fn parse(&self, file: &File) -> Vec<DocBlock> {
         let reader = BufReader::new(file);
         let mut code_line_no = 0;
         let mut line_buf = Vec::<String>::new();
+        let mut doc_blocks = Vec::<DocBlock>::new();
         let mut real_code_line = String::new();
-        let mut is_local = false;
         let mut is_mutli_line_function_decl = false;
         for line in reader.lines() {
-            // println!(
-            //     "当前行_{}:{}",
-            //     code_line_no + 1,
-            //     line.as_ref().unwrap_or(&String::new())
-            // );
             match line {
                 Ok(l) => {
                     code_line_no += 1;
@@ -308,9 +293,14 @@ impl FileParser for LuaFileParser {
                         // 如果是空行则清空缓冲区
                         println!("空行 no: {}", code_line_no);
                         line_buf.clear();
-						real_code_line.clear();
+                        real_code_line.clear();
                     } else if LuaFileParser::is_annotation_line(&l) {
                         println!("注释行 no: {}: {}", code_line_no, l);
+                        if (l.starts_with("-- @") || l.starts_with("---@"))
+                            && !l.starts_with("-- @!")
+                        {
+                            line_buf.push(l);
+                        }
                     } else {
                         let l = LuaFileParser::remove_annotation(&l);
                         if l.trim_start().starts_with("function")
@@ -323,11 +313,15 @@ impl FileParser for LuaFileParser {
                                 continue;
                             } else if LuaFileParser::is_api_tail(&l) {
                                 real_code_line += &l;
-                                // todo: 处理函数声明, 此时 real_code_line 就是一个完整的函数声明
+
                                 println!(
                                     "代码行_函数声明 no: {}: {}",
                                     code_line_no, real_code_line
                                 );
+                                line_buf.push(real_code_line.clone());
+                                doc_blocks.push(LuaFileParser::create_docblock(line_buf.clone()));
+                                line_buf.clear();
+                                real_code_line.clear();
                             }
                         }
                         if is_mutli_line_function_decl {
@@ -338,11 +332,14 @@ impl FileParser for LuaFileParser {
                             );
                             if LuaFileParser::is_api_tail(&l) {
                                 is_mutli_line_function_decl = false;
-                                // todo: 处理函数声明，此时 real_code_line 就是一个完整的函数声明
                                 println!(
                                     "代码行_函数声明end no: {}: {}",
                                     code_line_no, real_code_line
                                 );
+                                line_buf.push(real_code_line.clone());
+                                doc_blocks.push(LuaFileParser::create_docblock(line_buf.clone()));
+                                line_buf.clear();
+                                real_code_line.clear();
                             }
                         }
                     }

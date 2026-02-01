@@ -65,7 +65,7 @@ fn cmd_parser() {
 
             let parser = file_parser::create_file_parser(&file_type);
             let mid = parser.parse(&File::open(file_path).unwrap());
-            let _ = file_parser::MarkdownFormatter{}.format(mid);
+            let _ = file_parser::MarkdownFormatter {}.format(mid);
             match file_type {
                 Some(ft) => println!("文件类型: {}", ft.to_str().unwrap_or("unknown")),
                 None => println!("文件类型: unknown"),
@@ -74,8 +74,8 @@ fn cmd_parser() {
         }
     }
 }
+
 fn main() {
-    // 获取程序名
     let exe_name = env::args().next().unwrap_or_default();
     let exe_name = exe_name.to_lowercase();
     let is_todoc = exe_name.contains("todoc") || exe_name.contains("todocument");
@@ -86,5 +86,6 @@ fn main() {
     }
 
     cmd_parser();
+
     return;
 }

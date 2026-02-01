@@ -1,4 +1,6 @@
 use core::fmt;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -68,6 +70,7 @@ pub struct Description {
  * @param x number 第一个参数  (Parameter: name, type_name, description)
  * @param y number 第二个参数  (Parameter: name, type_name, description)
  * @return number 返回值说明   (Parameter: "", type_name, description)
+ * @includes <xxx>, <xxx>
  * @description
  *     \text text  (DescriptionType.Text)
  *     \code{}     (DescriptionType.Code)
@@ -82,9 +85,12 @@ pub struct DocBlock {
     pub signature: String,
     pub brief: String,
     pub note: String,
+    pub includes: Vec<String>,
     pub parameters: Vec<Parameter>,
     pub descriptions: Vec<Description>,
     pub ret_value: Option<Parameter>,
+    pub owner_object: String,
+    pub is_local: bool,
 }
 
 /// 解析器 trait：把文件解析成一组 DocBlock（中间结构）
@@ -97,25 +103,248 @@ pub trait OutputFileFormatter {
     fn format(&self, content: &DocBlock) -> String;
 }
 
+fn is_space_line(line: &str) -> bool {
+    for c in line.chars() {
+        if !c.is_whitespace() {
+            return false;
+        }
+    }
+    return true;
+}
 pub struct LuaFileParser {}
-
 impl LuaFileParser {
     const ANNOTATION: &'static str = "-- ";
 
-    pub fn is_annotation_line(line: &String) -> bool {
-        return line.trim_start().starts_with(Self::ANNOTATION);
+    pub fn is_annotation_line(line: &str) -> bool {
+        line.trim_start().starts_with(Self::ANNOTATION)
+    }
+
+    /// 捕获 API 声明：返回 Some((prefix, name))
+    /// prefix = "function" 或 "local function"
+    /// name = 函数名，如 "add" 或 "A:add" 或 "A.add"
+    pub fn capture_api_declaration(line: &str) -> Option<(String, String)> {
+        static API_DECL_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"^\s*(?P<prefix>local\s+function|function)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
+                .unwrap()
+        });
+
+        if let Some(caps) = API_DECL_RE.captures(line) {
+            let prefix = caps
+                .name("prefix")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let name = caps
+                .name("name")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            Some((prefix, name))
+        } else {
+            None
+        }
+    }
+
+    pub fn is_api_tail(line: &str) -> bool {
+        return line.ends_with(")") || line.trim_end().ends_with("end");
+    }
+
+    pub fn remove_annotation(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        let mut in_squote = false;
+        let mut in_dquote = false;
+        let mut in_longstring_level: Option<usize> = None;
+
+        while i < n {
+            if in_squote {
+                let c = chars[i];
+                out.push(c);
+                if c == '\\' {
+                    if i + 1 < n {
+                        i += 1;
+                        out.push(chars[i]);
+                    }
+                } else if c == '\'' {
+                    in_squote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_dquote {
+                let c = chars[i];
+                out.push(c);
+                if c == '\\' {
+                    if i + 1 < n {
+                        i += 1;
+                        out.push(chars[i]);
+                    }
+                } else if c == '"' {
+                    in_dquote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if let Some(level) = in_longstring_level {
+                if chars[i] == ']' {
+                    let mut j = i + 1;
+                    let mut eq = 0usize;
+                    while j < n && chars[j] == '=' {
+                        eq += 1;
+                        j += 1;
+                    }
+                    if eq == level && j < n && chars[j] == ']' {
+                        for t in i..=j {
+                            out.push(chars[t]);
+                        }
+                        i = j + 1;
+                        in_longstring_level = None;
+                        continue;
+                    }
+                }
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            let c = chars[i];
+            if c == '\'' {
+                in_squote = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_dquote = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+
+            if c == '[' {
+                let mut j = i + 1;
+                let mut eq = 0usize;
+                while j < n && chars[j] == '=' {
+                    eq += 1;
+                    j += 1;
+                }
+                if j < n && chars[j] == '[' {
+                    in_longstring_level = Some(eq);
+                    for t in i..=j {
+                        out.push(chars[t]);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+
+            // detect comment start '--'
+            if c == '-' && i + 1 < n && chars[i + 1] == '-' {
+                if i + 2 < n && chars[i + 2] == '[' {
+                    let mut j = i + 3;
+                    let mut eq = 0usize;
+                    while j < n && chars[j] == '=' {
+                        eq += 1;
+                        j += 1;
+                    }
+                    if j < n && chars[j] == '[' {
+                        let mut k = j + 1;
+                        let mut found = None;
+                        while k < n {
+                            if chars[k] == ']' {
+                                let mut m = k + 1;
+                                let mut eq2 = 0usize;
+                                while m < n && chars[m] == '=' {
+                                    eq2 += 1;
+                                    m += 1;
+                                }
+                                if eq2 == eq && m < n && chars[m] == ']' {
+                                    found = Some(m);
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        if let Some(endpos) = found {
+                            i = endpos + 1;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+
+        out.trim_start().trim_end().to_string()
     }
 }
 impl FileParser for LuaFileParser {
     fn parse(&self, file: &File) -> Vec<DocBlock> {
         let reader = BufReader::new(file);
+        let mut code_line_no = 0;
+        let mut line_buf = Vec::<String>::new();
+        let mut real_code_line = String::new();
+        let mut is_local = false;
+        let mut is_mutli_line_function_decl = false;
         for line in reader.lines() {
+            // println!(
+            //     "当前行_{}:{}",
+            //     code_line_no + 1,
+            //     line.as_ref().unwrap_or(&String::new())
+            // );
             match line {
                 Ok(l) => {
-                    if LuaFileParser::is_annotation_line(&l) {
-                        println!("注释行: {}", l);
+                    code_line_no += 1;
+                    if is_space_line(&l) {
+                        // 如果是空行则清空缓冲区
+                        println!("空行 no: {}", code_line_no);
+                        line_buf.clear();
+						real_code_line.clear();
+                    } else if LuaFileParser::is_annotation_line(&l) {
+                        println!("注释行 no: {}: {}", code_line_no, l);
                     } else {
-                        println!("代码行: {}", l);
+                        let l = LuaFileParser::remove_annotation(&l);
+                        if l.trim_start().starts_with("function")
+                            || l.trim_start().starts_with("local function")
+                        {
+                            if l.find("(").is_some() && !l.ends_with(")") {
+                                is_mutli_line_function_decl = true;
+                                real_code_line += &l;
+                                println!("代码行_分段函数声明start no: {}", code_line_no);
+                                continue;
+                            } else if LuaFileParser::is_api_tail(&l) {
+                                real_code_line += &l;
+                                // todo: 处理函数声明, 此时 real_code_line 就是一个完整的函数声明
+                                println!(
+                                    "代码行_函数声明 no: {}: {}",
+                                    code_line_no, real_code_line
+                                );
+                            }
+                        }
+                        if is_mutli_line_function_decl {
+                            real_code_line += &l;
+                            println!(
+                                "代码行》》》函数声明中 no: {}: {}",
+                                code_line_no, real_code_line
+                            );
+                            if LuaFileParser::is_api_tail(&l) {
+                                is_mutli_line_function_decl = false;
+                                // todo: 处理函数声明，此时 real_code_line 就是一个完整的函数声明
+                                println!(
+                                    "代码行_函数声明end no: {}: {}",
+                                    code_line_no, real_code_line
+                                );
+                            }
+                        }
                     }
                 }
                 Err(_) => continue,

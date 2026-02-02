@@ -65,7 +65,6 @@ pub struct Description {
     pub content: String,
 }
 /**
- * @!all 不会导出
  * @brief 这是一个示例函数      (brief)
  * @param x number 第一个参数  (Parameter: name, type_name, description)
  * @param y number 第二个参数  (Parameter: name, type_name, description)
@@ -263,8 +262,20 @@ impl LuaFileParser {
         out.trim_start().trim_end().to_string()
     }
 
+    pub fn is_doc_comment(line: &str) -> bool {
+        let t = line.trim_start();
+        return t.starts_with("---@") || t.starts_with("--@") || t.starts_with("-- @");
+    }
+
+    /// 解析并创建一个 DocBlock
+    /// 这里采用了两层解析结构：
+    /// 1. 第一层：识别 @tag
+    /// 2. 第二层：如果处于 @description 下，识别 \subtag
     pub fn create_docblock(buf: Vec<String>) -> DocBlock {
-        return DocBlock {
+        for str in &buf {
+            println!("Doc Line: {}", str);
+        }
+        let mut block = DocBlock {
             signature: String::new(),
             brief: String::new(),
             note: String::new(),
@@ -275,6 +286,102 @@ impl LuaFileParser {
             owner_object: String::new(),
             is_local: false,
         };
+
+        // 简单的状态机，用于处理多行内容（例如 description 下的子标签）
+        let mut current_tag = String::new();
+
+        for line in buf {
+            // 1. 清理注释符号，获取纯文本内容
+            // 简单实现：找到第一个 @ 或者 \ 之前的部分作为前缀去除，或者直接去除 --
+            // 实际工程中建议用正则或精确匹配
+            let content = if let Some(idx) = line.find("@") {
+                &line[idx..]
+            } else if let Some(idx) = line.find("\\") {
+                &line[idx..]
+            } else {
+                let t = line.trim_start();
+                if t.starts_with("--") {
+                    t.trim_start_matches('-').trim()
+                } else {
+                    t
+                }
+            };
+            
+            // 2. 解析主标签 @xxx
+            if content.starts_with("@") {
+                let parts: Vec<&str> = content.splitn(2, |c: char| c.is_whitespace()).collect();
+                let tag = &parts[0][1..]; // skip '@'
+                let body = if parts.len() > 1 { parts[1].trim() } else { "" };
+                
+                current_tag = tag.to_string();
+
+                match tag {
+                    "brief" => block.brief = body.to_string(),
+                    "param" => {
+                        // 解析 param: name type desc
+                        let p_parts: Vec<&str> = body.split_whitespace().collect();
+                        if p_parts.len() >= 2 {
+                            block.parameters.push(Parameter {
+                                name: p_parts[0].to_string(),
+                                type_name: p_parts[1].to_string(),
+                                number: block.parameters.len(),
+                                description: p_parts[2..].join(" "),
+                            });
+                        }
+                    }
+                    "return" => {
+                         let p_parts: Vec<&str> = body.split_whitespace().collect();
+                         if !p_parts.is_empty() {
+                            block.ret_value = Some(Parameter {
+                                name: "".to_string(),
+                                type_name: p_parts[0].to_string(),
+                                number: 0,
+                                description: p_parts[1..].join(" "),
+                            });
+                         }
+                    }
+                    "includes" => {
+                        // 简单逗号分隔
+                        for inc in body.split(',') {
+                            block.includes.push(inc.trim().to_string());
+                        }
+                    }
+                    "note" => block.note = body.to_string(),
+                    "description" => {
+                        // 进入 description 模式，后续行可能包含 \text 等
+                    }
+                    _ => {
+                        println!("Unknown tag: {}", tag);
+                    }
+                }
+            } else if content.starts_with("\\") {
+                 // 3. 解析子标签 (仅当在 description 下，或者设计为全局可用)
+                 // 为了扩展性，这里可以进一步封装成 parse_description_line(content)
+                if current_tag == "description" {
+                    let parts: Vec<&str> = content.splitn(2, |c: char| c.is_whitespace()).collect();
+                    let subtag = &parts[0][1..]; // skip '\'
+                    let body = if parts.len() > 1 { parts[1].trim() } else { "" };
+                    
+                    let desc_type = match subtag {
+                        "text" => Some(DescriptionType::Text(body.to_string())),
+                        "code" => Some(DescriptionType::Code(InputFileType::None, body.to_string())), // 需要更复杂的解析来支持 code{lua}
+                        "formula" => Some(DescriptionType::MathFormula(FormulaType::Inline, body.to_string())),
+                        "list" => Some(DescriptionType::BulletList(0, body.to_string())),
+                        "html" => Some(DescriptionType::HTMLLink(body.to_string())),
+                        _ => None,
+                    };
+
+                    if let Some(dt) = desc_type {
+                        block.descriptions.push(Description {
+                            dtype: dt,
+                            content: body.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        return block;
     }
 }
 impl FileParser for LuaFileParser {
@@ -285,70 +392,76 @@ impl FileParser for LuaFileParser {
         let mut doc_blocks = Vec::<DocBlock>::new();
         let mut real_code_line = String::new();
         let mut is_mutli_line_function_decl = false;
+        
         for line in reader.lines() {
             match line {
                 Ok(l) => {
                     code_line_no += 1;
+                    println!("Read: {}", &l);
+                    // 1. 收集文档行：只要是符合文档标记的行，或者在收集过程中遇到的普通注释行
+                    let is_comment = l.trim_start().starts_with("--");
+                    if LuaFileParser::is_doc_comment(&l) || (!line_buf.is_empty() && is_comment) {
+                         line_buf.push(l);
+                         continue;
+                    }
+                    
                     if is_space_line(&l) {
-                        // 如果是空行则清空缓冲区
-                        println!("空行 no: {}", code_line_no);
+                        // 空行通常意味着文档块和函数声明断开了连接 (根据具体风格决定)
                         line_buf.clear();
                         real_code_line.clear();
-                    } else if LuaFileParser::is_annotation_line(&l) {
-                        println!("注释行 no: {}: {}", code_line_no, l);
-                        if (l.starts_with("-- @") || l.starts_with("---@"))
-                            && !l.starts_with("-- @!")
-                        {
-                            line_buf.push(l);
+                        continue;
+                    }
+
+                    // 2. 解析代码行
+                    let code_content = LuaFileParser::remove_annotation(&l);
+                    
+                    // 简单判断是否开始函数定义
+                    if code_content.trim_start().starts_with("function")
+                        || code_content.trim_start().starts_with("local function")
+                    {
+                        // 拼接多行函数声明
+                        if code_content.find("(").is_some() && !code_content.ends_with(")") {
+                             is_mutli_line_function_decl = true;
+                             real_code_line += &code_content;
+                        } else if LuaFileParser::is_api_tail(&code_content) || code_content.contains(")") {
+                             // 单行函数定义结束 (简单判定)
+                             real_code_line += &code_content;
+                             
+                             // 核心逻辑：如果缓冲区有文档内容，则创建一个 Block 并关联
+                             if !line_buf.is_empty() {
+                                 let mut block = LuaFileParser::create_docblock(line_buf.clone());
+                                 block.signature = real_code_line.clone();
+                                 doc_blocks.push(block);
+                                 line_buf.clear(); // 消费掉 buffer
+                             }
+                             real_code_line.clear();
+                        }
+                    } else if is_mutli_line_function_decl {
+                        // 处理多行函数的后续部分
+                        real_code_line += &code_content;
+                        if LuaFileParser::is_api_tail(&code_content) {
+                            is_mutli_line_function_decl = false;
+                             if !line_buf.is_empty() {
+                                 let mut block = LuaFileParser::create_docblock(line_buf.clone());
+                                 block.signature = real_code_line.clone();
+                                 doc_blocks.push(block);
+                                 line_buf.clear();
+                             }
+                            real_code_line.clear();
                         }
                     } else {
-                        let l = LuaFileParser::remove_annotation(&l);
-                        if l.trim_start().starts_with("function")
-                            || l.trim_start().starts_with("local function")
-                        {
-                            if l.find("(").is_some() && !l.ends_with(")") {
-                                is_mutli_line_function_decl = true;
-                                real_code_line += &l;
-                                println!("代码行_分段函数声明start no: {}", code_line_no);
-                                continue;
-                            } else if LuaFileParser::is_api_tail(&l) {
-                                real_code_line += &l;
-
-                                println!(
-                                    "代码行_函数声明 no: {}: {}",
-                                    code_line_no, real_code_line
-                                );
-                                line_buf.push(real_code_line.clone());
-                                doc_blocks.push(LuaFileParser::create_docblock(line_buf.clone()));
-                                line_buf.clear();
-                                real_code_line.clear();
-                            }
-                        }
-                        if is_mutli_line_function_decl {
-                            real_code_line += &l;
-                            println!(
-                                "代码行》》》函数声明中 no: {}: {}",
-                                code_line_no, real_code_line
-                            );
-                            if LuaFileParser::is_api_tail(&l) {
-                                is_mutli_line_function_decl = false;
-                                println!(
-                                    "代码行_函数声明end no: {}: {}",
-                                    code_line_no, real_code_line
-                                );
-                                line_buf.push(real_code_line.clone());
-                                doc_blocks.push(LuaFileParser::create_docblock(line_buf.clone()));
-                                line_buf.clear();
-                                real_code_line.clear();
-                            }
-                        }
+                        // 其他非空行代码，清空之前的 doc buffer (因为它没有紧跟函数)
+                        // line_buf.clear(); 
+                        // *注*: 这里看需求，如果允许 doc 上方有少量非空行干扰，可以不 clear
+                        // 但通常 doc 紧贴 function。
+                        line_buf.clear(); 
                     }
                 }
                 Err(_) => continue,
             }
         }
 
-        return vec![];
+        return doc_blocks;
     }
 }
 

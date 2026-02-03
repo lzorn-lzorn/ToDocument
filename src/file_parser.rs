@@ -4,6 +4,7 @@ use regex::Regex;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
+#[derive(Debug)]
 pub enum InputFileType {
     None,
     Lua,
@@ -36,15 +37,18 @@ impl InputFileType {
     }
 }
 
+#[derive(Debug)]
 pub enum FormulaType {
     Inline,
     Block,
 }
+#[derive(Debug)]
 pub enum OutputFileType {
     Markdown,
 }
 
 /// 中间文档结构（简化）
+#[derive(Debug)]
 pub struct Parameter {
     pub name: String,
     pub number: usize,
@@ -52,6 +56,7 @@ pub struct Parameter {
     pub type_name: String,
 }
 
+#[derive(Debug)]
 pub enum DescriptionType {
     Text(String),
     Code(InputFileType, String),
@@ -60,6 +65,7 @@ pub enum DescriptionType {
     HTMLLink(String),
 }
 
+#[derive(Debug)]
 pub struct Description {
     pub dtype: DescriptionType,
     pub content: String,
@@ -80,6 +86,7 @@ pub struct Description {
  *     \html url   (DescriptionType.HTMLLink)
  * function signature (x, y) (signature)
  */
+#[derive(Debug)]
 pub struct DocBlock {
     pub signature: String,
     pub brief: String,
@@ -90,6 +97,36 @@ pub struct DocBlock {
     pub ret_value: Option<Parameter>,
     pub owner_object: String,
     pub is_local: bool,
+    pub is_member: bool,
+}
+
+impl std::fmt::Display for DocBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Signature: {}", self.signature)?;
+        writeln!(f, "Brief: {}", self.brief)?;
+        writeln!(f, "Note: {}", self.note)?;
+        writeln!(f, "Includes: {:?}", self.includes)?;
+        writeln!(f, "Parameters:")?;
+        for p in &self.parameters {
+            writeln!(
+                f,
+                "  - {}: {} ({})",
+                p.name, p.type_name, p.description
+            )?;
+        }
+        if let Some(ret) = &self.ret_value {
+            writeln!(
+                f,
+                "Return: {} ({})",
+                ret.type_name, ret.description
+            )?;
+        }
+        writeln!(f, "Descriptions:")?;
+        for d in &self.descriptions {
+            writeln!(f, "  - {:?}: {}", d.dtype, d.content)?;
+        }
+        Ok(())
+    }
 }
 
 /// 解析器 trait：把文件解析成一组 DocBlock（中间结构）
@@ -267,6 +304,46 @@ impl LuaFileParser {
         return t.starts_with("---@") || t.starts_with("--@") || t.starts_with("-- @");
     }
 
+    pub fn extract_owner_object(line: &str) -> String {
+        let line = line.trim();
+        let s = if line.starts_with("local function") {
+            return "local".to_string();
+        } else if line.starts_with("function") {
+            &line[8..]
+        } else {
+            return String::new();
+        };
+
+        let s = s.trim_start();
+        if let Some(idx) = s.find(|c| c == '.' || c == ':') {
+            return s[..idx].trim().to_string();
+        }
+        String::new()
+    }
+
+    pub fn is_member_function(line: &str, obj_name: &str) -> bool {
+        return if line.find(":").is_some() == false {
+            let dot_idx = line.find(".");
+            if dot_idx.is_some() {
+                let left_bracket_idx = line.find("(").unwrap();
+                let right_bracket_idx = line.find(")").unwrap();
+                let sub_params_list = &line[left_bracket_idx..right_bracket_idx];
+                let first_comma_idx = sub_params_list.find(",");
+                if first_comma_idx.is_some() {
+                    // 有参数列表的情况下 拿到第一个参数
+                    let first_param = &sub_params_list[1..first_comma_idx.unwrap()].trim();
+                    if *first_param == obj_name { true } else { false }
+                }else{
+                    // 一个参数就是table name, function A.function(A) 也是一个成员函数
+                    if sub_params_list.trim().len() > 0 && sub_params_list == obj_name { true }else{ false }
+                }
+            }else{
+                false
+            }
+        } else {
+            true
+        };
+    }
     /// 解析并创建一个 DocBlock
     /// 这里采用了两层解析结构：
     /// 1. 第一层：识别 @tag
@@ -285,6 +362,7 @@ impl LuaFileParser {
             ret_value: None,
             owner_object: String::new(),
             is_local: false,
+            is_member: false,
         };
 
         // 简单的状态机，用于处理多行内容（例如 description 下的子标签）
@@ -387,7 +465,6 @@ impl LuaFileParser {
 impl FileParser for LuaFileParser {
     fn parse(&self, file: &File) -> Vec<DocBlock> {
         let reader = BufReader::new(file);
-        let mut code_line_no = 0;
         let mut line_buf = Vec::<String>::new();
         let mut doc_blocks = Vec::<DocBlock>::new();
         let mut real_code_line = String::new();
@@ -396,7 +473,6 @@ impl FileParser for LuaFileParser {
         for line in reader.lines() {
             match line {
                 Ok(l) => {
-                    code_line_no += 1;
                     println!("Read: {}", &l);
                     // 1. 收集文档行：只要是符合文档标记的行，或者在收集过程中遇到的普通注释行
                     let is_comment = l.trim_start().starts_with("--");
@@ -431,6 +507,16 @@ impl FileParser for LuaFileParser {
                              if !line_buf.is_empty() {
                                  let mut block = LuaFileParser::create_docblock(line_buf.clone());
                                  block.signature = real_code_line.clone();
+                                 let _m_ret = LuaFileParser::extract_owner_object(&real_code_line);
+                                 if _m_ret == "local" {
+                                    block.is_local = true;
+                                    block.is_member = false;
+                                    block.owner_object = "".to_string();
+                                 }else{
+                                    block.owner_object = _m_ret;
+                                    block.is_member = LuaFileParser::is_member_function(&real_code_line, &block.owner_object);
+                                 }
+                                 
                                  doc_blocks.push(block);
                                  line_buf.clear(); // 消费掉 buffer
                              }
@@ -439,16 +525,31 @@ impl FileParser for LuaFileParser {
                     } else if is_mutli_line_function_decl {
                         // 处理多行函数的后续部分
                         real_code_line += &code_content;
-                        if LuaFileParser::is_api_tail(&code_content) {
+                        
+                        // 检查这一行是否结束了函数声明（包含 ')' 或者以 'end' 结尾）
+                        if LuaFileParser::is_api_tail(&code_content) || code_content.contains(")") {
                             is_mutli_line_function_decl = false;
-                             if !line_buf.is_empty() {
-                                 let mut block = LuaFileParser::create_docblock(line_buf.clone());
-                                 block.signature = real_code_line.clone();
-                                 doc_blocks.push(block);
-                                 line_buf.clear();
-                             }
+                            
+                            if !line_buf.is_empty() {
+                                let mut block = LuaFileParser::create_docblock(line_buf.clone());
+                                block.signature = real_code_line.clone();
+                                let _m_ret = LuaFileParser::extract_owner_object(&real_code_line);
+                                if _m_ret == "local" {
+                                   block.is_local = true;
+                                   block.is_member = false;
+                                   block.owner_object = "".to_string();
+                                } else {
+                                   block.owner_object = _m_ret;
+                                   // 现在 real_code_line 应该是完整的，包含 ')'，所以 is_member_function 不会 panic
+                                   block.is_member = LuaFileParser::is_member_function(&real_code_line, &block.owner_object);
+                                }
+                                doc_blocks.push(block);
+                                line_buf.clear();
+                            }
                             real_code_line.clear();
                         }
+                        // 如果还没结束，保持 is_mutli_line_function_decl = true，继续读下一行拼接
+                        
                     } else {
                         // 其他非空行代码，清空之前的 doc buffer (因为它没有紧跟函数)
                         // line_buf.clear(); 
@@ -456,6 +557,7 @@ impl FileParser for LuaFileParser {
                         // 但通常 doc 紧贴 function。
                         line_buf.clear(); 
                     }
+                    
                 }
                 Err(_) => continue,
             }

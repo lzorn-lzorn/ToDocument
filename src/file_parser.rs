@@ -88,16 +88,16 @@ pub struct Description {
  */
 #[derive(Debug)]
 pub struct DocBlock {
-    pub signature: String,
-    pub brief: String,
-    pub note: String,
-    pub includes: Vec<String>,
-    pub parameters: Vec<Parameter>,
+    pub signature   : String,
+    pub brief       : String,
+    pub note        : String,
+    pub includes    : Vec<String>,
+    pub parameters  : Vec<Parameter>,
     pub descriptions: Vec<Description>,
-    pub ret_value: Option<Parameter>,
+    pub ret_value   : Option<Parameter>,
     pub owner_object: String,
-    pub is_local: bool,
-    pub is_member: bool,
+    pub is_local    : bool,
+    pub is_member   : bool,
 }
 
 impl std::fmt::Display for DocBlock {
@@ -353,16 +353,16 @@ impl LuaFileParser {
             println!("Doc Line: {}", str);
         }
         let mut block = DocBlock {
-            signature: String::new(),
-            brief: String::new(),
-            note: String::new(),
-            includes: vec![],
-            parameters: vec![],
+            signature   : String::new(),
+            brief       : String::new(),
+            note        : String::new(),
+            includes    : vec![],
+            parameters  : vec![],
             descriptions: vec![],
-            ret_value: None,
+            ret_value   : None,
             owner_object: String::new(),
-            is_local: false,
-            is_member: false,
+            is_local    : false,
+            is_member   : false,
         };
 
         // 简单的状态机，用于处理多行内容（例如 description 下的子标签）
@@ -608,12 +608,128 @@ pub fn create_file_parser(optkind: &Option<InputFileType>) -> Box<dyn FileParser
 
 /// 简单的 Markdown 格式化器示例
 pub struct MarkdownFormatter {}
+
 impl MarkdownFormatter {
+    /// 格式化函数签名
+    fn format_signature(&self, signature: &str) -> String {
+        format!("```lua\n{}\n```\n", signature)
+    }
+
+    /// 格式化 Includes
+    fn format_includes(&self, includes: &[String]) -> String {
+        if includes.is_empty() {
+            return String::new();
+        }
+        format!("**Includes:** {}\n\n", includes.join(", "))
+    }
+
+    /// 格式化 Brief
+    fn format_brief(&self, brief: &str) -> String {
+        if brief.is_empty() {
+            return String::new();
+        }
+        format!("**Brief:** {}\n\n", brief)
+    }
+
+    /// 格式化参数列表
+    fn format_parameters(&self, params: &[Parameter]) -> String {
+        if params.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("**Parameters:**\n");
+        for p in params {
+            use std::fmt::Write;
+            let _ = writeln!(s, "- {} ({}): {}", p.name, p.type_name, p.description);
+        }
+        s.push('\n');
+        s
+    }
+
+    /// 格式化返回值
+    fn format_return(&self, ret: &Option<Parameter>) -> String {
+        match ret {
+            Some(p) => format!(
+                "**Returns:** {} ({}): {}\n\n",
+                p.name, p.type_name, p.description
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// 格式化单个描述项
+    fn format_description_item(&self, desc: &Description) -> String {
+        match &desc.dtype {
+            DescriptionType::Text(_) => format!("{}\n", desc.content),
+            DescriptionType::Code(lang, _) => {
+                let lang_str = lang.to_str().unwrap_or("");
+                format!("```{}\n{}\n```\n", lang_str, desc.content)
+            }
+            DescriptionType::MathFormula(ft, _) => match ft {
+                FormulaType::Inline => format!("${}$\n", desc.content),
+                FormulaType::Block => format!("$$\n{}\n$$\n", desc.content),
+            },
+            DescriptionType::BulletList(_, _) => {
+                // 如果内容本身不包含 '- ' 前缀，则补上
+                let content = desc.content.trim();
+                let prefix = if content.starts_with("-") {
+                    ""
+                } else {
+                    "- "
+                };
+                format!("{}{}\n", prefix, content)
+            }
+            DescriptionType::HTMLLink(_) => {
+                // [link](url) - 这里假设 content 是 url
+                format!("[{}]({})\n", desc.content, desc.content)
+            }
+        }
+    }
+
+    /// 格式化描述部分
+    fn format_descriptions(&self, descriptions: &[Description]) -> String {
+        if descriptions.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("**Description:**\n\n");
+        for d in descriptions {
+            s.push_str(&self.format_description_item(d));
+        }
+        s.push('\n');
+        s
+    }
+
+    /// 格式化单个 DocBlock
+    fn format_block(&self, block: &DocBlock) -> String {
+        let mut s = String::new();
+        
+        // 1. Signature
+        s.push_str(&self.format_signature(&block.signature));
+
+        // 2. Includes
+        s.push_str(&self.format_includes(&block.includes));
+
+        // 3. Brief
+        s.push_str(&self.format_brief(&block.brief));
+
+        // 4. Parameters
+        s.push_str(&self.format_parameters(&block.parameters));
+
+        // 5. Returns
+        s.push_str(&self.format_return(&block.ret_value));
+
+        // 6. Detailed Descriptions
+        s.push_str(&self.format_descriptions(&block.descriptions));
+
+        s
+    }
+
     pub fn format(&self, content: Vec<DocBlock>) -> Result<String, fmt::Error> {
         let mut s = String::new();
-        println!("MarkdownFormatter Run");
-        // todo:
-        return Ok(s);
+        for block in content {
+            s.push_str(&self.format_block(&block));
+            s.push_str("---\n\n");
+        }
+        Ok(s)
     }
 }
 
